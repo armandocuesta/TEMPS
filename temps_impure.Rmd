@@ -1,0 +1,251 @@
+---
+title: "Temps.impure"
+output: html_document
+---
+
+Load libraries
+```{r}
+library (foreign)
+library(ggplot2)
+library(memisc)
+library(dplyr)
+library(foreign)
+library(caret)
+library(e1071)
+library(lattice)
+library(MASS)
+library(rpart.plot)
+library(rpart)
+library(rattle)
+library(glmnet)
+library(stringr)
+library(ISLR) 
+```
+
+
+only RUN this only if you want numeric data for the TEMPS
+```{r}
+tempsnum <- subset(tempsdata, select = -c(gender, race, diagnosis, psychotic))
+tempsnum <- as.data.frame(lapply(tempsnum, as.numeric))
+head(tempsnum)
+
+tempsfac <- select(tempsdata, id, gender, race, diagnosis, psychotic)
+temps <- full_join(tempsnum, tempsfac, by = "id")
+```
+
+
+if not, start here:
+
+```{r}
+temps <- read.spss("J:\\psych\\Neurocognition Lab\\Heterogeneity\\Data_Heterogeneity\\TEMPS machine learning project\\Temps_impure.sav", 
+           to.data.frame=TRUE)
+
+
+str(temps$diagnosis)
+str(temps$tempD_1)
+str(temps$gender)
+str(temps$psychotic)
+str(temps$id)
+```
+
+Removing ID, wrat3
+```{r}
+temps$id <- NULL
+temps$wrat3_raw <- NULL
+temps$wrat3_standard <- NULL
+head(temps)
+```
+
+Training and testing the model
+```{r}
+temps <- na.omit(temps)
+
+set.seed(1)
+trainIndex <- createDataPartition(temps$diagnosis, p = .8,
+                                  list = FALSE, times = 1)
+trainIndex %>% head()
+
+training.y <- temps[trainIndex, "diagnosis"]
+testing.y <- temps[-trainIndex, "diagnosis"]
+
+training <- temps %>%
+  select(-matches("diagnosis")) %>%
+  slice(trainIndex)
+
+testing <- temps %>%
+  select(-matches("diagnosis")) %>%
+  slice(-trainIndex)
+str(training)
+```
+
+Dimension reduction via zero-variance
+```{r}
+nzv <- nearZeroVar(training)
+if(length(nzv) >0) {
+  training <- training[, -nzv];
+  testing <- testing[, -nzv]
+}
+dim(testing)
+dim(temps)
+```
+
+Since some predictors are factors:
+```{r}
+sapply(training, is.factor) # shows which are factors
+f.pos <- which( sapply(training, is.factor) ) # finds position of factors
+f.pos
+#split to two data frames - one with factors, another with numbers
+training.f <- select(training, f.pos)
+training.n <- select(training, -f.pos)
+testing.f <- select(testing, f.pos)
+testing.n <- select(testing, -f.pos)
+```
+
+Complete some analysis with numerics only
+```{r}
+preProcValues <- preProcess(training.n, method = c("center", "scale", "knnImpute",
+"BoxCox", "YeoJohnson"))
+# choose what you need
+# you may want to create a separate predictor stating
+# if you have NA or not before you do NA imputation
+training.n <- predict(preProcValues, training.n)
+testing.n <- predict(preProcValues, testing.n)
+```
+
+Correlations
+```{r}
+descrCor <- cor(training.n)
+highlyCorDescr <- findCorrelation( x = descrCor, cutoff = .75, verbose = FALSE)
+if(length(highlyCorDescr) >0) { # if found any
+  training <- training[, -highlyCorDescr];
+  testing <- testing[, -highlyCorDescr]
+  }
+```
+
+Linear Dependencies
+```{r}
+comboInfo <- findLinearCombos(training.n)
+comboInfo
+```
+$linearCombos
+list()
+
+$remove
+NULL
+```{r}
+if(length(comboInfo$remove) >0) {
+  training.n <- training.n[, -comboInfo$remove];
+  testing.n <- testing.n[, -comboInfo$remove]
+}
+```
+
+
+Combine them back
+```{r}
+head(training.n)
+head(testing.n)
+head(training.f)
+head(testing.f)
+training.full <- cbind(training.n, training.f)
+testing.full <- cbind(testing.n, testing.f)
+str(training.full)
+```
+
+
+Doing logistic regression (this does not work)
+```{r}
+# add output into dataFrame
+head(training.full)
+training.full$diagnosis <- training.y
+testing.full$diagnosis <- testing.y
+glm.fit=glm(diagnosis ~., 
+            data=training.full,
+            family=binomial)
+summary (glm.fit)
+plot(glm.fit)
+
+length(coef(glm.fit))
+library(stringr); library(dplyr)
+c.n <- names(coef(glm.fit))
+c.n %>%
+subset( str_detect( c.n, pattern = "__") ) %>%
+str_split_fixed("__", n=2) %>%
+data.frame() %>%
+select(1) %>%
+unique()
+
+```
+
+classification tree
+
+```{r}
+rtGrid = expand.grid(cp=seq(0.01, 0.2, by = 0.005))
+ctrl <- trainControl(method = "repeatedcv", number = 10, verboseIter = T)
+
+ctTune <- train(diagnosis ~ ., data = training.full,   
+                  method = "rpart", 
+                  tuneGrid = rtGrid,
+                  #metric='RMSE',#The metric is different for class.
+                  trControl = ctrl)
+
+ctTune
+plot(ctTune)
+ctTune$bestTune
+fancyRpartPlot(ctTune$finalModel)# in nodes: class name,
+#          , , , 
+#          percentage of data assigned for this class
+
+```
+
+Predicting using testing set:
+
+```{r}
+
+##########################################predict on test
+pr_ct <- predict(ctTune, newdata = testing.full)
+ct_CM <- confusionMatrix(pr_ct, testing.full$diagnosis)
+ct_CM
+
+
+```
+
+Do lasso (with cross validation) with caret to remove predictors
+you don't need
+```{r}
+enetGrid <- expand.grid(.alpha = c(1),
+                        .lambda = seq(0, 20, by = 0.1))
+
+ctrl <- trainControl(method = "cv", number = 10,
+                     verboseIter = T)
+set.seed(1)
+enetTune <- train(diagnosis ~ ., data = training.full,
+                  method = "glmnet",
+                  tuneGrid = enetGrid,
+                  trControl = ctrl)
+enetTune
+enetTune$bestTune
+plot(enetTune)
+fin_model <- enetTune$finalModel
+non.zero.ind <- predict(fin_model, s = enetTune$bestTune$lambda,
+                        type = "nonzero")
+non.zero.ind
+enetCoef[enetCoef != 0] %>% head
+as.matrix(enetCoef) %>% head
+
+enetCoef <- predict(fin_model, s = enetTune$bestTune$lambda,
+                    type = "coef" )
+enetCoef[1:20, ]
+
+```
+
+
+```{r}
+training.full.subset <- data.frame(
+training.full[, unlist(non.zero.ind) ],
+diagnosis = training.full$diagnosis)
+dim(training.full.subset)
+
+
+
+```
+
